@@ -14,7 +14,8 @@ sleep 1
 echo "==> Updating packages (a few minutes)"
 CLIPSAFE_UPDATE=1 bash "${ROOT}/local/install-mac.sh"
 
-echo "==> Starting ClipSafe"
-chmod +x "${ROOT}/local/start-mac.command"
-open "${ROOT}/local/start-mac.command"
-echo "Done. ClipSafe opens in your browser in a few seconds."
+chmod +x "${ROOT}/local/"*.sh "${ROOT}/local/start-mac.command" 2>/dev/null || true
+xattr -d com.apple.quarantine "${ROOT}/local/start-mac.command" 2>/dev/null || true
+
+echo "==> Starting ClipSafe (keep this Terminal window open)"
+exec bash "${ROOT}/local/start-mac.command"
