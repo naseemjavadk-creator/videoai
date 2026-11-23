@@ -23,7 +23,7 @@ Use it only on videos you own or have permission to clip.
    - Mac password ചോദിച്ചാൽ type ചെയ്യുക (type ചെയ്യുമ്പോൾ ഒന്നും കാണില്ല, അത് സാധാരണമാണ്).
    - Gemini key ചോദിക്കുമ്പോൾ paste ചെയ്ത് Enter.
    - ആദ്യ install-ന് 15–30 മിനിറ്റ് എടുക്കാം.
-6. **Start:** `local/start-mac.command` double-click ചെയ്യുക. ("unidentified developer" എന്ന് വന്നാൽ: right-click → Open → Open.) Browser-ൽ http://localhost:3000 തുറക്കും.
+6. **Start:** Dock-ലെ **ClipSafe AI** icon click ചെയ്യുക (Applications folder-ലും ഉണ്ട്). ഏകദേശം 20 സെക്കൻഡിനുള്ളിൽ browser-ൽ http://localhost:3000 തുറക്കും. Terminal വേണ്ട. നിർത്താൻ Applications-ലെ **Stop ClipSafe** click ചെയ്യുക. ("Documents folder access" ചോദിച്ചാൽ **Allow**.)
 7. YouTube link ഇടുക, "I own this video" tick ചെയ്യുക, **Generate**.
 
 **Update ചെയ്യാൻ:** Terminal-ൽ ClipSafe folder-ലേക്ക് `cd` ചെയ്ത് ഇത് run ചെയ്യുക:
@@ -32,7 +32,6 @@ Use it only on videos you own or have permission to clip.
 curl -fsSL https://github.com/naseemjavadk-creator/videoai/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 && bash local/update-mac.sh
 ```
 
-Terminal window തുറന്നു വെക്കുക. Close ചെയ്താൽ ClipSafe നിൽക്കും.
 
 ## Notes
 

@@ -176,9 +176,12 @@ NEXT_TELEMETRY_DISABLED=1 npm run build
 chmod +x "${ROOT}/local/start-mac.command" "${ROOT}/local/install-mac.sh"
 ok "Dashboard built"
 
+bash "${ROOT}/local/make-app-mac.sh" || warn "Could not create the Dock app; use local/start-mac.command instead."
+
 cat <<DONE
 
 ${G}ClipSafe AI is installed.${N}
+Click the ClipSafe AI icon in the Dock to start it.
 
 Start it any time by double-clicking:
     ${ROOT}/local/start-mac.command
