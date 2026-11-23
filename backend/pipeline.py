@@ -4,8 +4,8 @@ ClipSafe AI media pipeline.
 Turns a long-form YouTube video (one the user owns or has the rights to clip) into
 vertical 9:16 Shorts with original, transformative layers:
 
-    yt-dlp ............. download the source and a low-res analysis proxy
-    Gemini 2.5 Pro ..... pick the strongest segments, write commentary + metadata (JSON)
+    yt-dlp ............. read video details, then download only the chosen clip sections
+    Gemini ............. pick the strongest segments, write commentary + metadata (JSON)
     demucs ............. isolate the spoken vocals of each segment
     Cloud TTS .......... Chirp 3 HD voiceover for the intro and outro commentary
     Imagen 3 ........... original B-roll images for the split screen and title cards
@@ -24,11 +24,13 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -68,7 +70,7 @@ class Settings(BaseSettings):
     vertex_location: str = "us-central1"
     speech_location: str = "us-central1"
     speech_model: str = "chirp_2"
-    gemini_model: str = "gemini-2.5-pro"
+    gemini_model: str = "gemini-3.8-flash"
     imagen_model: str = "imagen-3.0-generate-001"
     tts_voice: str = "en-US-Chirp3-HD-Charon"
     service_account_email: Optional[str] = None
@@ -84,13 +86,18 @@ class Settings(BaseSettings):
 
     # Local mode
     gemini_api_key: Optional[str] = None
-    gemini_fallback_model: str = "gemini-2.5-flash"
+    gemini_fallback_model: str = "gemini-3.5-flash-lite"
     pexels_api_key: Optional[str] = None
     whisper_model: str = "small"
     yunet_model_path: str = "models/face_detection_yunet_2023mar.onnx"
     data_dir: str = "../data"
     public_base_url: str = "http://127.0.0.1:8080"
     retention_hours: int = 24
+
+    # Speed
+    download_height: int = 0          # 0 = auto (720 in local mode, 1080 on Cloud Run)
+    gemini_youtube_direct: bool = True  # let Gemini watch the YouTube link (no download needed)
+    demucs_device: str = "auto"         # auto | cpu | mps | cuda
 
     @property
     def is_local(self) -> bool:
@@ -198,14 +205,16 @@ class ViralPlan(BaseModel):
 
 @dataclass
 class SourceVideo:
-    path: Path
-    proxy_path: Path
+    path: Optional[Path]          # full download (only if section download is impossible)
+    proxy_path: Optional[Path]    # low-res copy for Gemini (only if it cannot watch the link)
     title: str
     channel: str
     duration: float
     width: int
     height: int
     webpage_url: str
+    workdir: Optional[Path] = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass
@@ -494,13 +503,38 @@ def _ytdlp_base_opts() -> dict[str, Any]:
     return opts
 
 
-def _download_sync(url: str, workdir: Path) -> dict[str, Any]:
+def _download_height() -> int:
+    s = get_settings()
+    if s.download_height > 0:
+        return s.download_height
+    return 720 if s.is_local else 1080
+
+
+def _video_format(height: int) -> str:
+    # Prefer H.264 + AAC so cutting is fast and nothing needs transcoding before render.
+    return (
+        f"bv*[height<={height}][vcodec^=avc1]+ba[ext=m4a]/bv*[height<={height}]+ba/"
+        f"b[height<={height}]/b"
+    )
+
+
+def _ytdlp_error(exc: Exception) -> PipelineError:
+    msg = str(exc)
+    if "Sign in to confirm" in msg or "not a bot" in msg:
+        return PipelineError(
+            "YouTube asked for a sign-in check. Add cookies from your own account (see README) and retry."
+        )
+    if "Private video" in msg or "members-only" in msg.lower():
+        return PipelineError("That video is private or members-only")
+    last = msg.strip().splitlines()[-1] if msg.strip() else "unknown error"
+    return PipelineError(f"Download failed: {last[:300]}")
+
+
+def _probe_sync(url: str) -> dict[str, Any]:
     import yt_dlp  # imported lazily: heavy module
 
     s = get_settings()
-    base = _ytdlp_base_opts()
-
-    with yt_dlp.YoutubeDL({**base, "skip_download": True}) as ydl:
+    with yt_dlp.YoutubeDL({**_ytdlp_base_opts(), "skip_download": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     if info is None:
         raise PipelineError("Could not read that video")
@@ -515,71 +549,147 @@ def _download_sync(url: str, workdir: Path) -> dict[str, Any]:
         raise PipelineError(
             f"Video is {int(duration // 60)} min long; the limit is {s.max_source_duration_seconds // 60} min"
         )
-
-    dl_opts = {
-        **base,
-        "format": "bv*[height<=1080][vcodec^=avc1]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
-        "merge_output_format": "mp4",
-        "outtmpl": str(workdir / "source.%(ext)s"),
-        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
-    }
-    with yt_dlp.YoutubeDL(dl_opts) as ydl:
-        ydl.download([info.get("webpage_url") or url])
     return info
 
 
-async def download_source(url: str, workdir: Path, progress: ProgressCallback) -> SourceVideo:
-    await progress("download", 0.02, "Downloading the source video")
+def _ytdlp_download_sync(url: str, extra: dict[str, Any]) -> None:
+    import yt_dlp
+
+    opts = {**_ytdlp_base_opts(), "merge_output_format": "mp4", **extra}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.download([url])
+
+
+def _progress_hook(progress: ProgressCallback, stage: str, base: float, span: float, label: str):
+    """yt-dlp runs in a worker thread; forward its byte progress to the async callback."""
+    loop = asyncio.get_running_loop()
+    last = {"t": 0.0}
+
+    def hook(d: dict[str, Any]) -> None:
+        if d.get("status") != "downloading":
+            return
+        now = time.monotonic()
+        if now - last["t"] < 1.0:
+            return
+        last["t"] = now
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        done = d.get("downloaded_bytes") or 0
+        frac = min(1.0, done / total) if total else 0.0
+        speed = d.get("speed") or 0
+        speed_txt = f" · {speed / 1_048_576:.1f} MB/s" if speed else ""
+        asyncio.run_coroutine_threadsafe(
+            progress(stage, base + span * frac, f"{label} {int(frac * 100)}%{speed_txt}"), loop
+        )
+
+    return hook
+
+
+async def probe_source(url: str, workdir: Path, progress: ProgressCallback) -> SourceVideo:
+    """Read title/duration without downloading the video."""
+    await progress("download", 0.02, "Reading video details")
     try:
-        info = await asyncio.to_thread(_download_sync, url, workdir)
+        info = await asyncio.to_thread(_probe_sync, url)
     except PipelineError:
         raise
     except Exception as exc:  # yt-dlp raises DownloadError and friends
-        msg = str(exc)
-        if "Sign in to confirm" in msg or "bot" in msg.lower():
-            raise PipelineError(
-                "YouTube asked for a sign-in check. Add cookies from your own account (see README) and retry."
-            ) from exc
-        if "Private video" in msg or "members-only" in msg.lower():
-            raise PipelineError("That video is private or members-only") from exc
-        raise PipelineError(f"Download failed: {msg.splitlines()[-1][:300]}") from exc
-
-    path = workdir / "source.mp4"
-    if not path.exists():
-        candidates = sorted(workdir.glob("source.*"))
-        if not candidates:
-            raise PipelineError("Download finished but no video file was produced")
-        path = candidates[0]
-
-    width, height = await ffprobe_video_size(path)
-    duration = await ffprobe_duration(path)
-
-    # Low-res proxy keeps the Gemini upload small and fast (Gemini samples ~1 fps anyway).
-    await progress("download", 0.08, "Preparing an analysis copy")
-    proxy = workdir / "proxy.mp4"
-    await run_cmd(
-        [
-            "ffmpeg", "-hide_banner", "-y", "-i", str(path),
-            "-vf", "scale=-2:360,fps=5", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
-            "-c:a", "aac", "-b:a", "64k", "-ac", "1", "-movflags", "+faststart", str(proxy),
-        ],
-        timeout=1800,
-    )
-
+        raise _ytdlp_error(exc) from exc
     return SourceVideo(
-        path=path,
-        proxy_path=proxy,
+        path=None,
+        proxy_path=None,
         title=str(info.get("title") or "Untitled"),
         channel=str(info.get("channel") or info.get("uploader") or "Unknown channel"),
-        duration=duration,
-        width=width,
-        height=height,
+        duration=float(info["duration"]),
+        width=int(info.get("width") or 1920),
+        height=int(info.get("height") or 1080),
         webpage_url=str(info.get("webpage_url") or url),
+        workdir=workdir,
     )
+
+
+async def ensure_proxy(source: SourceVideo, progress: ProgressCallback) -> Path:
+    """Low-resolution copy for Gemini, downloaded directly (no re-encode)."""
+    async with source.lock:
+        if source.proxy_path and source.proxy_path.exists():
+            return source.proxy_path
+        assert source.workdir is not None
+        hook = _progress_hook(progress, "download", 0.04, 0.06, "Downloading a small copy for Gemini")
+        try:
+            await asyncio.to_thread(
+                _ytdlp_download_sync,
+                source.webpage_url,
+                {
+                    "format": "bv*[height<=360][ext=mp4]+ba[ext=m4a]/b[height<=360]/bv*[height<=480]+ba/worst",
+                    "outtmpl": str(source.workdir / "proxy.%(ext)s"),
+                    "progress_hooks": [hook],
+                },
+            )
+        except Exception as exc:
+            raise _ytdlp_error(exc) from exc
+        found = sorted(source.workdir.glob("proxy.*"))
+        if not found:
+            raise PipelineError("Download finished but no video file was produced")
+        source.proxy_path = found[0]
+        return source.proxy_path
+
+
+async def ensure_full(source: SourceVideo, progress: ProgressCallback) -> Path:
+    """Whole video at the working resolution (fallback when section download fails)."""
+    async with source.lock:
+        if source.path and source.path.exists():
+            return source.path
+        assert source.workdir is not None
+        hook = _progress_hook(progress, "render", 0.2, 0.0, "Downloading the full video")
+        try:
+            await asyncio.to_thread(
+                _ytdlp_download_sync,
+                source.webpage_url,
+                {
+                    "format": _video_format(_download_height()),
+                    "outtmpl": str(source.workdir / "source.%(ext)s"),
+                    "progress_hooks": [hook],
+                },
+            )
+        except Exception as exc:
+            raise _ytdlp_error(exc) from exc
+        found = sorted(source.workdir.glob("source.*"))
+        if not found:
+            raise PipelineError("Download finished but no video file was produced")
+        source.path = found[0]
+        return source.path
+
+
+async def fetch_section(
+    source: SourceVideo, seg: "ViralSegment", out_dir: Path, progress: ProgressCallback
+) -> tuple[Path, float]:
+    """Download just this segment. Returns (file, offset of seg.start_seconds inside file)."""
+    from yt_dlp.utils import download_range_func
+
+    pad = 0.5
+    start = max(0.0, seg.start_seconds - pad)
+    end = min(source.duration, seg.end_seconds + pad)
+    try:
+        await asyncio.to_thread(
+            _ytdlp_download_sync,
+            source.webpage_url,
+            {
+                "format": _video_format(_download_height()),
+                "outtmpl": str(out_dir / "section.%(ext)s"),
+                "download_ranges": download_range_func(None, [(start, end)]),
+                "force_keyframes_at_cuts": True,
+            },
+        )
+        found = sorted(out_dir.glob("section.*"))
+        if found and found[0].stat().st_size > 0:
+            return found[0], seg.start_seconds - start
+        raise PipelineError("section download produced no file")
+    except Exception as exc:
+        logger.warning("Section download failed (%s); downloading the full video instead", exc)
+    full = await ensure_full(source, progress)
+    return full, seg.start_seconds
 
 
 # --------------------------------------------------------------------------------------
-# Step 2: Gemini 2.5 Pro viral-moment extraction
+# Step 2: Gemini viral-moment extraction
 # --------------------------------------------------------------------------------------
 
 GEMINI_SYSTEM = """You are a senior short-form video editor and an original commentator.
@@ -601,18 +711,7 @@ Return only JSON that matches the schema."""
 async def extract_viral_plan(
     source: SourceVideo, opts: JobOptions, job_id: str, progress: ProgressCallback
 ) -> ViralPlan:
-    await progress("analyze", 0.12, "Gemini is watching the video")
     s = get_settings()
-    if s.is_local:
-        from local_providers import gemini_upload_video
-
-        try:
-            proxy_uri, proxy_mime = await gemini_upload_video(genai_client(), source.proxy_path)
-        except Exception as exc:
-            raise PipelineError(f"Could not send the video to Gemini: {exc}") from exc
-    else:
-        proxy_uri = await upload_file(source.proxy_path, f"jobs/{job_id}/proxy.mp4", "video/mp4")
-        proxy_mime = "video/mp4"
 
     prompt = f"""Video title: {source.title}
 Channel: {source.channel}
@@ -632,45 +731,74 @@ Order segments by viral_score, highest first."""
         max_output_tokens=16384,
         media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
     )
-    contents = [
-        genai_types.Content(
-            role="user",
-            parts=[
-                genai_types.Part.from_uri(file_uri=proxy_uri, mime_type=proxy_mime),
-                genai_types.Part.from_text(text=prompt),
-            ],
-        )
-    ]
-
-    response = None
     models = [s.gemini_model]
     if s.is_local and s.gemini_fallback_model and s.gemini_fallback_model != s.gemini_model:
-        models.append(s.gemini_fallback_model)  # free-tier Pro quota is small; Flash has more
-    last_exc: Optional[Exception] = None
-    for model_name in models:
-        try:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(3),
-                wait=wait_exponential(multiplier=2, min=4, max=30),
-                retry=retry_if_exception_type(Exception),
-                reraise=True,
-            ):
-                with attempt:
-                    response = await genai_client().aio.models.generate_content(
-                        model=model_name, contents=contents, config=config
-                    )
-                    if response.parsed is None and not (response.text or "").strip():
-                        raise PipelineError("Gemini returned an empty response")
-            break
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("Gemini model %s failed: %s", model_name, exc)
-            response = None
-    if response is None:
+        models.append(s.gemini_fallback_model)  # Flash-Lite has a much bigger free daily quota
+
+    async def ask(media: Any, attempts: int) -> Any:
+        contents = [genai_types.Content(role="user", parts=[media, genai_types.Part.from_text(text=prompt)])]
+        last_exc: Optional[Exception] = None
+        tried: list[str] = []
+        queue = list(models)
+        while queue:
+            model_name = queue.pop(0)
+            if model_name in tried:
+                continue
+            tried.append(model_name)
+            try:
+                async for attempt in AsyncRetrying(
+                    stop=stop_after_attempt(attempts),
+                    wait=wait_exponential(multiplier=2, min=4, max=30),
+                    retry=retry_if_exception_type(Exception),
+                    reraise=True,
+                ):
+                    with attempt:
+                        resp = await genai_client().aio.models.generate_content(
+                            model=model_name, contents=contents, config=config
+                        )
+                        if resp.parsed is None and not (resp.text or "").strip():
+                            raise PipelineError("Gemini returned an empty response")
+                        return resp
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("Gemini model %s failed: %s", model_name, exc)
+                # Google retires models and names the replacement in the 404 message
+                # ("... Please update your code to use models/gemini-x-flash"): follow it.
+                suggested = re.search(r"use (?:models/)?(gemini-[\w.\-]+[\w])", str(exc))
+                if suggested and suggested.group(1) not in tried:
+                    queue.insert(0, suggested.group(1))
         msg = str(last_exc or "")
         if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
             raise PipelineError("Gemini free quota is used up for now. Try again later or tomorrow.") from last_exc
         raise PipelineError(f"Gemini request failed: {msg[:300]}") from last_exc
+
+    response = None
+    if s.is_local and s.gemini_youtube_direct:
+        # Fastest path: Gemini fetches the public YouTube video itself, nothing to download.
+        await progress("analyze", 0.06, "Gemini is watching the video")
+        try:
+            response = await ask(
+                genai_types.Part(file_data=genai_types.FileData(file_uri=source.webpage_url)), attempts=1
+            )
+        except PipelineError as exc:
+            if "quota" in str(exc):
+                raise
+            logger.warning("Gemini could not watch the link directly (%s); uploading a small copy", exc)
+
+    if response is None:
+        proxy = await ensure_proxy(source, progress)
+        await progress("analyze", 0.12, "Gemini is watching the video")
+        if s.is_local:
+            from local_providers import gemini_upload_video
+
+            try:
+                proxy_uri, proxy_mime = await gemini_upload_video(genai_client(), proxy)
+            except Exception as exc:
+                raise PipelineError(f"Could not send the video to Gemini: {exc}") from exc
+        else:
+            proxy_uri = await upload_file(proxy, f"jobs/{job_id}/proxy.mp4", "video/mp4")
+            proxy_mime = "video/mp4"
+        response = await ask(genai_types.Part.from_uri(file_uri=proxy_uri, mime_type=proxy_mime), attempts=3)
 
     assert response is not None
     plan: Optional[ViralPlan] = response.parsed if isinstance(response.parsed, ViralPlan) else None
@@ -727,14 +855,37 @@ def _clean_segments(segments: list[ViralSegment], duration: float, opts: JobOpti
 _DEMUCS_LOCK = asyncio.Semaphore(1)  # demucs saturates every CPU core; run one at a time
 
 
-async def cut_segment(source: SourceVideo, seg: ViralSegment, out: Path) -> None:
+@lru_cache(maxsize=1)
+def _has_videotoolbox() -> bool:
+    if sys.platform != "darwin":
+        return False
+    try:
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=20).stdout
+        return "h264_videotoolbox" in out
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return False
+
+
+def h264_args(kind: str) -> list[str]:
+    """Encoder settings. On a Mac the hardware encoder (VideoToolbox) is several times faster."""
+    if _has_videotoolbox():
+        rate = "14M" if kind == "intermediate" else "9M"
+        return ["-c:v", "h264_videotoolbox", "-b:v", rate, "-maxrate", "18M", "-bufsize", "24M",
+                "-profile:v", "high", "-allow_sw", "1"]
+    if kind == "intermediate":
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16"]
+    preset = "veryfast" if get_settings().is_local else "medium"
+    return ["-c:v", "libx264", "-preset", preset, "-crf", "20", "-profile:v", "high", "-level", "4.2"]
+
+
+async def cut_segment(src: Path, start: float, length: float, out: Path) -> None:
     await run_cmd(
         [
             "ffmpeg", "-hide_banner", "-y",
-            "-ss", f"{seg.start_seconds:.3f}", "-to", f"{seg.end_seconds:.3f}",
-            "-i", str(source.path),
+            "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
+            "-i", str(src),
             "-map", "0:v:0", "-map", "0:a:0?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+            *h264_args("intermediate"), "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(out),
         ],
@@ -752,16 +903,28 @@ async def isolate_vocals(segment_video: Path, workdir: Path) -> Path:
     )
     out_dir = workdir / "demucs"
     threads = str(max(1, os.cpu_count() or 1))
+    devices = [s.demucs_device]
+    if s.demucs_device == "auto":
+        # Apple Silicon GPU (MPS) is much faster than the CPU; fall back to CPU if it fails.
+        devices = ["mps", "cpu"] if (sys.platform == "darwin" and platform.machine() == "arm64") else ["cpu"]
     async with _DEMUCS_LOCK:
-        await run_cmd(
-            [
-                sys.executable, "-m", "demucs.separate",
-                "-n", s.demucs_model, "--two-stems", "vocals", "-d", "cpu",
-                "--filename", "{stem}.{ext}", "-o", str(out_dir), "-j", "1", str(mix),
-            ],
-            timeout=1800,
-            env={"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads},
-        )
+        for i, device in enumerate(devices):
+            shutil.rmtree(out_dir, ignore_errors=True)
+            try:
+                await run_cmd(
+                    [
+                        sys.executable, "-m", "demucs.separate",
+                        "-n", s.demucs_model, "--two-stems", "vocals", "-d", device,
+                        "--filename", "{stem}.{ext}", "-o", str(out_dir), "-j", "1", str(mix),
+                    ],
+                    timeout=1800,
+                    env={"OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads, "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+                )
+                break
+            except PipelineError as exc:
+                if i == len(devices) - 1:
+                    raise
+                logger.warning("demucs on %s failed (%s); retrying on %s", device, exc, devices[i + 1])
     found = sorted(out_dir.rglob("vocals.wav"))
     if not found:
         raise PipelineError("Vocal isolation produced no output")
@@ -1335,7 +1498,7 @@ async def render_short(r: RenderInputs, workdir: Path, out: Path) -> None:
             "-i", str(r.outro_audio),
             "-filter_complex_script", graph_file.name,
             "-map", "[vout]", "-map", "[aout]",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-profile:v", "high", "-level", "4.2",
+            *h264_args("final"),
             "-pix_fmt", "yuv420p", "-r", str(get_settings().out_fps), "-g", str(get_settings().out_fps * 2),
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
             "-movflags", "+faststart", str(out),
@@ -1378,10 +1541,15 @@ async def process_clip(
     accent = ACCENTS[index % len(ACCENTS)]
     voice = opts.tts_voice or s.tts_voice
 
-    await report(0.05, "Cutting the segment")
     segment_video = cdir / "segment.mp4"
-    await cut_segment(source, seg, segment_video)
+    await report(0.02, "Downloading this clip")
+    section, offset = await fetch_section(source, seg, cdir, _noop_progress)
+    await report(0.1, "Cutting the segment")
+    await cut_segment(section, offset, seg.end_seconds - seg.start_seconds, segment_video)
+    if section != source.path:
+        section.unlink(missing_ok=True)
     main_duration = await ffprobe_duration(segment_video)
+    seg_w, seg_h = await ffprobe_video_size(segment_video)
     if s.is_local:
         seg_uri_task = asyncio.create_task(asyncio.sleep(0, result=f"local://{gcs_prefix}/segment.mp4"))
     else:
@@ -1411,7 +1579,7 @@ async def process_clip(
     seg_uri = await seg_uri_task
     target_aspect = s.out_width / (s.out_height / 2)
     crop_task = asyncio.create_task(
-        track_faces(seg_uri, source.width, source.height, main_duration, target_aspect, segment_video)
+        track_faces(seg_uri, seg_w, seg_h, main_duration, target_aspect, segment_video)
     )
 
     await report(0.3, "Isolating the spoken vocals")
@@ -1524,7 +1692,7 @@ async def run_pipeline(
     workdir = Path(s.work_dir) / f"job_{job_id}_{uuid.uuid4().hex[:6]}"
     workdir.mkdir(parents=True, exist_ok=True)
     try:
-        source = await download_source(url, workdir, progress)
+        source = await probe_source(url, workdir, progress)
         plan = await extract_viral_plan(source, opts, job_id, progress)
 
         n = len(plan.segments)

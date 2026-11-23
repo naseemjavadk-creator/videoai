@@ -65,7 +65,7 @@ Browser ──► clipsafe-web (Next.js, public Cloud Run)
                ▼
             clipsafe-api (FastAPI, private Cloud Run, 4 vCPU / 16 GiB)
                ├─ yt-dlp ............ fetch the source video
-               ├─ Gemini 2.5 Pro .... pick viral segments + write commentary (JSON)
+               ├─ Gemini 3.8 Flash .. pick viral segments + write commentary (JSON)
                ├─ demucs ............ isolate vocals
                ├─ Cloud TTS ......... Chirp 3 HD commentary voiceover
                ├─ Imagen 3 .......... original B-roll images
@@ -230,7 +230,7 @@ Set by `deploy.sh`; listed here for local development.
 | `VERTEX_LOCATION` | `us-central1` | Vertex AI region for Gemini and Imagen |
 | `SPEECH_LOCATION` | `us-central1` | Speech-to-Text V2 region |
 | `SPEECH_MODEL` | `chirp_2` | Speech-to-Text V2 model |
-| `GEMINI_MODEL` | `gemini-2.5-pro` | Segment selection + commentary |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Segment selection + commentary |
 | `IMAGEN_MODEL` | `imagen-3.0-generate-001` | B-roll images |
 | `TTS_VOICE` | `en-US-Chirp3-HD-Charon` | Commentary voice |
 | `SERVICE_ACCOUNT_EMAIL` | backend SA | Used to sign V4 URLs via IAM |

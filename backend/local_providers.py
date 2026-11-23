@@ -3,7 +3,7 @@ Free, no-billing replacements used when MODE=local (ClipSafe running on your own
 
     Google Cloud service             Local / free replacement
     -------------------------------  ---------------------------------------------------
-    Vertex AI Gemini 2.5 Pro         Gemini API with a free Google AI Studio key
+    Vertex AI Gemini                 Gemini API with a free Google AI Studio key
     Cloud Text-to-Speech             edge-tts (Microsoft Edge neural voices, no key)
     Speech-to-Text V2                faster-whisper running on your CPU
     Video Intelligence face tracks   OpenCV YuNet face detector (Haar cascade fallback)

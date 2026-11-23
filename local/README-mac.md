@@ -26,13 +26,23 @@ Use it only on videos you own or have permission to clip.
 6. **Start:** `local/start-mac.command` double-click ചെയ്യുക. ("unidentified developer" എന്ന് വന്നാൽ: right-click → Open → Open.) Browser-ൽ http://localhost:3000 തുറക്കും.
 7. YouTube link ഇടുക, "I own this video" tick ചെയ്യുക, **Generate**.
 
+**Update ചെയ്യാൻ:** Terminal-ൽ ClipSafe folder-ലേക്ക് `cd` ചെയ്ത് ഇത് run ചെയ്യുക:
+
+```bash
+curl -fsSL https://github.com/naseemjavadk-creator/videoai/archive/refs/heads/main.tar.gz | tar -xz --strip-components=1 && bash local/update-mac.sh
+```
+
 Terminal window തുറന്നു വെക്കുക. Close ചെയ്താൽ ClipSafe നിൽക്കും.
 
 ## Notes
 
-- **Speed:** each Short takes a few minutes; vocal isolation and Whisper use your CPU.
-- **Free limits:** the Gemini free tier has daily limits. If Gemini 2.5 Pro is out of quota,
-  ClipSafe falls back to Gemini 2.5 Flash automatically. Free-tier prompts may be used by Google
+- **Speed:** Gemini watches the YouTube link directly, and only the chosen clip sections are
+  downloaded (720p). On Apple Silicon, vocal isolation uses the GPU and rendering uses the
+  hardware video encoder. Expect roughly 2–3 minutes per Short. Set `DOWNLOAD_HEIGHT=1080` in
+  `backend/.env` for sharper (slower) downloads.
+- **Free limits:** the Gemini free tier has daily limits. ClipSafe uses Gemini 3.8 Flash and falls back to
+  Gemini 3.5 Flash-Lite when the free daily quota runs out. If Google retires a model, ClipSafe
+  follows the replacement Google names; you can also set `GEMINI_MODEL` in `backend/.env`. Free-tier prompts may be used by Google
   to improve its products.
 - **Captions quality:** for better Malayalam captions set `WHISPER_MODEL=medium` in
   `backend/.env` and run the installer again (slower, uses more memory).

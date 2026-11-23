@@ -456,7 +456,7 @@ export default function Dashboard() {
           {!job && !jobId && (
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               {[
-                { icon: Sparkles, t: "Gemini 2.5 Pro", d: "Viral moments" },
+                { icon: Sparkles, t: "Gemini", d: "Viral moments" },
                 { icon: Mic, t: "Vocal isolation", d: "demucs" },
                 { icon: Wand2, t: "AI commentary", d: "Chirp 3 HD" },
                 { icon: ImageIcon, t: "B-roll", d: "Imagen 3" },

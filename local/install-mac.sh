@@ -112,7 +112,7 @@ if [[ -z "${GEMINI_API_KEY}" ]]; then
 fi
 
 PEXELS_API_KEY="${PEXELS_API_KEY:-$(current PEXELS_API_KEY)}"
-if [[ -z "${PEXELS_API_KEY}" ]]; then
+if [[ -z "${PEXELS_API_KEY}" && -z "${CLIPSAFE_UPDATE:-}" ]]; then
   echo
   echo "Optional: a FREE Pexels key gives your Shorts real stock-photo B-roll."
   echo "Get one at https://www.pexels.com/api/ (sign up, 'Your API Key'). Press Enter to skip."
@@ -125,8 +125,8 @@ API_KEY="$(current API_KEY)"; API_KEY="${API_KEY:-$(openssl rand -hex 24)}"
 cat > "${ENV_FILE}" <<ENVEOF
 MODE=local
 GEMINI_API_KEY=${GEMINI_API_KEY}
-GEMINI_MODEL=$(current GEMINI_MODEL | grep . || echo gemini-2.5-pro)
-GEMINI_FALLBACK_MODEL=$(current GEMINI_FALLBACK_MODEL | grep . || echo gemini-2.5-flash)
+GEMINI_MODEL=$(current GEMINI_MODEL | grep -v "^gemini-2\." | grep . || echo gemini-3.8-flash)
+GEMINI_FALLBACK_MODEL=$(current GEMINI_FALLBACK_MODEL | grep -v "^gemini-2\." | grep . || echo gemini-3.5-flash-lite)
 PEXELS_API_KEY=${PEXELS_API_KEY}
 WHISPER_MODEL=${WHISPER_MODEL}
 API_KEY=${API_KEY}
@@ -161,7 +161,7 @@ if "${VPY}" - "${GEMINI_API_KEY}" <<'PYEOF'
 import sys
 from google import genai
 client = genai.Client(api_key=sys.argv[1])
-r = client.models.generate_content(model="gemini-2.5-flash", contents="Reply with the single word: ready")
+r = client.models.generate_content(model="gemini-3.5-flash-lite", contents="Reply with the single word: ready")
 print(" ✓ Gemini says:", (r.text or "").strip()[:40])
 PYEOF
 then :; else
