@@ -44,7 +44,6 @@ from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
@@ -87,6 +86,7 @@ class Settings(BaseSettings):
     # Local mode
     gemini_api_key: Optional[str] = None
     gemini_fallback_model: str = "gemini-3.5-flash-lite"
+    gemini_extra_models: str = "gemini-3.6-flash,gemini-3.1-flash-lite"
     pexels_api_key: Optional[str] = None
     whisper_model: str = "small"
     yunet_model_path: str = "models/face_detection_yunet_2023mar.onnx"
@@ -732,10 +732,21 @@ Order segments by viral_score, highest first."""
         media_resolution=genai_types.MediaResolution.MEDIA_RESOLUTION_LOW,
     )
     models = [s.gemini_model]
-    if s.is_local and s.gemini_fallback_model and s.gemini_fallback_model != s.gemini_model:
-        models.append(s.gemini_fallback_model)  # Flash-Lite has a much bigger free daily quota
+    if s.gemini_fallback_model:
+        models.append(s.gemini_fallback_model)
+    if s.is_local:
+        # Other free models to try when Google is overloaded (503) or a quota runs out (429).
+        models += [m.strip() for m in s.gemini_extra_models.split(",") if m.strip()]
 
-    async def ask(media: Any, attempts: int) -> Any:
+    def is_overloaded(exc: Exception) -> bool:
+        m = str(exc)
+        return any(k in m for k in ("503", "UNAVAILABLE", "high demand", "overloaded", "500 INTERNAL", "504", "DEADLINE"))
+
+    def is_quota(exc: Exception) -> bool:
+        m = str(exc)
+        return "429" in m or "RESOURCE_EXHAUSTED" in m
+
+    async def ask(media: Any, retries_per_model: int) -> Any:
         contents = [genai_types.Content(role="user", parts=[media, genai_types.Part.from_text(text=prompt)])]
         last_exc: Optional[Exception] = None
         tried: list[str] = []
@@ -745,31 +756,39 @@ Order segments by viral_score, highest first."""
             if model_name in tried:
                 continue
             tried.append(model_name)
-            try:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(attempts),
-                    wait=wait_exponential(multiplier=2, min=4, max=30),
-                    retry=retry_if_exception_type(Exception),
-                    reraise=True,
-                ):
-                    with attempt:
-                        resp = await genai_client().aio.models.generate_content(
-                            model=model_name, contents=contents, config=config
-                        )
-                        if resp.parsed is None and not (resp.text or "").strip():
-                            raise PipelineError("Gemini returned an empty response")
-                        return resp
-            except Exception as exc:
-                last_exc = exc
-                logger.warning("Gemini model %s failed: %s", model_name, exc)
-                # Google retires models and names the replacement in the 404 message
-                # ("... Please update your code to use models/gemini-x-flash"): follow it.
-                suggested = re.search(r"use (?:models/)?(gemini-[\w.\-]+[\w])", str(exc))
-                if suggested and suggested.group(1) not in tried:
-                    queue.insert(0, suggested.group(1))
+            for attempt in range(retries_per_model):
+                try:
+                    resp = await genai_client().aio.models.generate_content(
+                        model=model_name, contents=contents, config=config
+                    )
+                    if resp.parsed is None and not (resp.text or "").strip():
+                        raise PipelineError("Gemini returned an empty response")
+                    return resp
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning("Gemini %s attempt %d failed: %s", model_name, attempt + 1, str(exc)[:300])
+                    # Google retires models and names the replacement in the 404 message
+                    # ("... Please update your code to use models/gemini-x-flash"): follow it.
+                    suggested = re.search(r"use (?:models/)?(gemini-[\w.\-]+[\w])", str(exc))
+                    if suggested and suggested.group(1) not in tried:
+                        queue.insert(0, suggested.group(1))
+                        break
+                    if is_quota(exc):
+                        break  # this model's free quota is used up: try the next model
+                    if is_overloaded(exc) or isinstance(exc, PipelineError):
+                        if attempt + 1 < retries_per_model:
+                            wait = 5 * (2 ** attempt)
+                            await progress("analyze", 0.06, f"Gemini is busy, retrying in {wait}s ({model_name})")
+                            await asyncio.sleep(wait)
+                        continue
+                    break  # other errors (e.g. this model can't read the input): next model
         msg = str(last_exc or "")
-        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        if is_quota(last_exc or Exception()):
             raise PipelineError("Gemini free quota is used up for now. Try again later or tomorrow.") from last_exc
+        if last_exc is not None and is_overloaded(last_exc):
+            raise PipelineError(
+                "Gemini is overloaded right now (Google's servers are busy). Press Retry in a few minutes."
+            ) from last_exc
         raise PipelineError(f"Gemini request failed: {msg[:300]}") from last_exc
 
     response = None
@@ -778,11 +797,11 @@ Order segments by viral_score, highest first."""
         await progress("analyze", 0.06, "Gemini is watching the video")
         try:
             response = await ask(
-                genai_types.Part(file_data=genai_types.FileData(file_uri=source.webpage_url)), attempts=1
+                genai_types.Part(file_data=genai_types.FileData(file_uri=source.webpage_url)), retries_per_model=3
             )
         except PipelineError as exc:
-            if "quota" in str(exc):
-                raise
+            if "quota" in str(exc) or "overloaded" in str(exc):
+                raise  # a downloaded copy would hit the same limit
             logger.warning("Gemini could not watch the link directly (%s); uploading a small copy", exc)
 
     if response is None:
@@ -798,7 +817,7 @@ Order segments by viral_score, highest first."""
         else:
             proxy_uri = await upload_file(proxy, f"jobs/{job_id}/proxy.mp4", "video/mp4")
             proxy_mime = "video/mp4"
-        response = await ask(genai_types.Part.from_uri(file_uri=proxy_uri, mime_type=proxy_mime), attempts=3)
+        response = await ask(genai_types.Part.from_uri(file_uri=proxy_uri, mime_type=proxy_mime), retries_per_model=3)
 
     assert response is not None
     plan: Optional[ViralPlan] = response.parsed if isinstance(response.parsed, ViralPlan) else None

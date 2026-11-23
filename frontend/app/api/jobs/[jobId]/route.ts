@@ -19,6 +19,17 @@ export async function GET(_req: Request, { params }: { params: { jobId: string }
   }
 }
 
+export async function POST(_req: Request, { params }: { params: { jobId: string } }) {
+  // Retry: queue a new job with the same settings.
+  if (!validId(params.jobId)) return NextResponse.json({ error: "Job not found" }, { status: 404 });
+  try {
+    const out = await backendJson<{ job_id: string }>(`/api/jobs/${params.jobId}/retry`, { method: "POST" });
+    return NextResponse.json(out, { status: 202 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
 export async function DELETE(_req: Request, { params }: { params: { jobId: string } }) {
   if (!validId(params.jobId)) return NextResponse.json({ error: "Job not found" }, { status: 404 });
   try {

@@ -675,6 +675,22 @@ async def get_job(job_id: str) -> JobOut:
     return await build_job_out(doc)
 
 
+@app.post(
+    "/api/jobs/{job_id}/retry",
+    response_model=CreateJobResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_api_key)],
+)
+async def retry_job(job_id: str) -> CreateJobResponse:
+    """Queue a new job with the same settings as a failed or cancelled one."""
+    if not job_id.isalnum() or len(job_id) > 32:
+        raise HTTPException(status_code=404, detail="Job not found")
+    doc = await store.get(job_id)
+    if doc is None or not doc.get("request"):
+        raise HTTPException(status_code=404, detail="Job not found (jobs are deleted after 24 hours)")
+    return await create_job(CreateJobRequest(**doc["request"]))
+
+
 @app.delete("/api/jobs/{job_id}", dependencies=[Depends(require_api_key)])
 async def delete_job(job_id: str) -> dict[str, Any]:
     if not job_id.isalnum() or len(job_id) > 32:

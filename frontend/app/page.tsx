@@ -15,6 +15,7 @@ import {
   LogOut,
   Mic,
   RefreshCw,
+  RotateCcw,
   ScanFace,
   ShieldCheck,
   Sparkles,
@@ -215,6 +216,17 @@ export default function Dashboard() {
       setFormError(err instanceof Error ? err.message : "Could not start the job");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function retry(id: string) {
+    setFormError(null);
+    try {
+      const created = await api<{ job_id: string }>(`/api/jobs/${id}`, { method: "POST" });
+      selectJob(created.job_id);
+      void loadHistory();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Could not retry the job");
     }
   }
 
@@ -500,6 +512,11 @@ export default function Dashboard() {
                   {active && (
                     <button type="button" className="btn-ghost text-rose-300" onClick={() => cancelOrDelete(job.job_id)}>
                       <XCircle className="h-4 w-4" /> Cancel
+                    </button>
+                  )}
+                  {(job.status === "failed" || job.status === "cancelled") && (
+                    <button type="button" className="btn-ghost text-cyan-200" onClick={() => retry(job.job_id)}>
+                      <RotateCcw className="h-4 w-4" /> Retry
                     </button>
                   )}
                   {job.status === "succeeded" && (
