@@ -5,6 +5,9 @@ Shorts: Gemini picks the strongest moments, then the pipeline adds original AI
 commentary, AI B-roll split-screen, speaker-tracked 9:16 framing and animated captions,
 and you can upload the result straight to your own YouTube channel.
 
+> **No Google Cloud account or card?** Run ClipSafe free on your Mac with a free Google AI
+> Studio key: see [local/README-mac.md](local/README-mac.md).
+
 ## Rights and responsible use
 
 - Use ClipSafe AI only on videos **you own**, or that you have a licence or written

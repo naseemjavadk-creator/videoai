@@ -37,12 +37,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 from google import genai
-from google.api_core.client_options import ClientOptions
-from google.cloud import storage
-from google.cloud import texttospeech
-from google.cloud import videointelligence
-from google.cloud.speech_v2 import SpeechClient
-from google.cloud.speech_v2.types import cloud_speech
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -65,8 +59,12 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    gcp_project: str
-    gcs_bucket: str
+    # "gcp": Google Cloud services (Vertex AI, Cloud TTS, Speech, Video Intelligence, GCS)
+    # "local": free stack on your own computer (AI Studio key, edge-tts, Whisper, OpenCV,
+    #          Pexels, local folder). See local_providers.py.
+    mode: str = "gcp"
+    gcp_project: str = ""
+    gcs_bucket: str = ""
     vertex_location: str = "us-central1"
     speech_location: str = "us-central1"
     speech_model: str = "chirp_2"
@@ -84,6 +82,20 @@ class Settings(BaseSettings):
     max_concurrent_jobs: int = 1
     max_clips_per_job: int = 5
 
+    # Local mode
+    gemini_api_key: Optional[str] = None
+    gemini_fallback_model: str = "gemini-2.5-flash"
+    pexels_api_key: Optional[str] = None
+    whisper_model: str = "small"
+    yunet_model_path: str = "models/face_detection_yunet_2023mar.onnx"
+    data_dir: str = "../data"
+    public_base_url: str = "http://127.0.0.1:8080"
+    retention_hours: int = 24
+
+    @property
+    def is_local(self) -> bool:
+        return self.mode.lower() == "local"
+
     # Render constants
     out_width: int = 1080
     out_height: int = 1920
@@ -92,7 +104,22 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    s = Settings()  # type: ignore[call-arg]
+    if s.is_local:
+        if not s.gemini_api_key:
+            raise RuntimeError("MODE=local needs GEMINI_API_KEY (free key from https://aistudio.google.com/apikey)")
+    elif not (s.gcp_project and s.gcs_bucket):
+        raise RuntimeError("MODE=gcp needs GCP_PROJECT and GCS_BUCKET")
+    return s
+
+
+def local_path(key: str) -> Path:
+    """Map a storage key like 'jobs/abc/clips/00/short.mp4' to a file in DATA_DIR (local mode)."""
+    root = Path(get_settings().data_dir).expanduser().resolve()
+    target = (root / key).resolve()
+    if root not in target.parents and target != root:
+        raise PipelineError("Invalid storage path")
+    return target
 
 
 # --------------------------------------------------------------------------------------
@@ -146,6 +173,10 @@ class ViralSegment(BaseModel):
     )
     outro_commentary: str = Field(
         description="Original spoken takeaway or question to the viewer (10-20 words)."
+    )
+    broll_search_terms: list[str] = Field(
+        default_factory=list,
+        description="Exactly 3 short stock-photo search terms (1-3 English words each) for the B-roll.",
     )
     broll_prompts: list[str] = Field(
         description="Exactly 3 vivid image prompts for original B-roll that illustrate the topic. "
@@ -224,29 +255,43 @@ class PipelineResult:
 # --------------------------------------------------------------------------------------
 
 
+# Google Cloud libraries are imported inside these factories so local mode does not need them.
+
+
 @lru_cache(maxsize=1)
 def genai_client() -> genai.Client:
     s = get_settings()
+    if s.is_local:
+        return genai.Client(api_key=s.gemini_api_key)
     return genai.Client(vertexai=True, project=s.gcp_project, location=s.vertex_location)
 
 
 @lru_cache(maxsize=1)
-def storage_client() -> storage.Client:
+def storage_client() -> Any:
+    from google.cloud import storage
+
     return storage.Client(project=get_settings().gcp_project)
 
 
 @lru_cache(maxsize=1)
-def tts_client() -> texttospeech.TextToSpeechClient:
+def tts_client() -> Any:
+    from google.cloud import texttospeech
+
     return texttospeech.TextToSpeechClient()
 
 
 @lru_cache(maxsize=1)
-def video_client() -> videointelligence.VideoIntelligenceServiceClient:
+def video_client() -> Any:
+    from google.cloud import videointelligence
+
     return videointelligence.VideoIntelligenceServiceClient()
 
 
 @lru_cache(maxsize=1)
-def speech_client() -> SpeechClient:
+def speech_client() -> Any:
+    from google.api_core.client_options import ClientOptions
+    from google.cloud.speech_v2 import SpeechClient
+
     loc = get_settings().speech_location
     endpoint = "speech.googleapis.com" if loc == "global" else f"{loc}-speech.googleapis.com"
     return SpeechClient(client_options=ClientOptions(api_endpoint=endpoint))
@@ -352,6 +397,12 @@ def font_file(pattern: str = "Noto Sans:bold") -> str:
     raise PipelineError("No bold font found on this system")
 
 
+def font_for_language(language_code: str) -> str:
+    """Bold font that covers the script of the video language (Malayalam, Devanagari, …)."""
+    lang = (language_code or "en").split("-")[0].lower()
+    return font_file(f"Noto Sans:bold:lang={lang}")
+
+
 def _font_family(path: str) -> str:
     try:
         return subprocess.run(
@@ -384,6 +435,11 @@ def _sanitize_url(url: str) -> str:
 
 
 def _upload_sync(local: Path, gcs_path: str, content_type: str) -> str:
+    if get_settings().is_local:
+        target = local_path(gcs_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(local, target)
+        return f"local://{gcs_path}"
     bucket = storage_client().bucket(get_settings().gcs_bucket)
     blob = bucket.blob(gcs_path)
     blob.chunk_size = 16 * 1024 * 1024
@@ -397,9 +453,15 @@ async def upload_file(local: Path, gcs_path: str, content_type: str) -> str:
 
 async def upload_json(data: Any, gcs_path: str) -> str:
     def _do() -> str:
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        if get_settings().is_local:
+            target = local_path(gcs_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text, encoding="utf-8")
+            return f"local://{gcs_path}"
         bucket = storage_client().bucket(get_settings().gcs_bucket)
         blob = bucket.blob(gcs_path)
-        blob.upload_from_string(json.dumps(data, ensure_ascii=False, indent=2), content_type="application/json")
+        blob.upload_from_string(text, content_type="application/json")
         return f"gs://{bucket.name}/{gcs_path}"
 
     return await asyncio.to_thread(_do)
@@ -540,7 +602,17 @@ async def extract_viral_plan(
     source: SourceVideo, opts: JobOptions, job_id: str, progress: ProgressCallback
 ) -> ViralPlan:
     await progress("analyze", 0.12, "Gemini is watching the video")
-    proxy_uri = await upload_file(source.proxy_path, f"jobs/{job_id}/proxy.mp4", "video/mp4")
+    s = get_settings()
+    if s.is_local:
+        from local_providers import gemini_upload_video
+
+        try:
+            proxy_uri, proxy_mime = await gemini_upload_video(genai_client(), source.proxy_path)
+        except Exception as exc:
+            raise PipelineError(f"Could not send the video to Gemini: {exc}") from exc
+    else:
+        proxy_uri = await upload_file(source.proxy_path, f"jobs/{job_id}/proxy.mp4", "video/mp4")
+        proxy_mime = "video/mp4"
 
     prompt = f"""Video title: {source.title}
 Channel: {source.channel}
@@ -552,7 +624,6 @@ inside 0 and {source.duration:.1f} seconds.
 Commentary voice and tone: {opts.commentary_style}.
 Order segments by viral_score, highest first."""
 
-    s = get_settings()
     config = genai_types.GenerateContentConfig(
         system_instruction=GEMINI_SYSTEM,
         response_mime_type="application/json",
@@ -565,25 +636,41 @@ Order segments by viral_score, highest first."""
         genai_types.Content(
             role="user",
             parts=[
-                genai_types.Part.from_uri(file_uri=proxy_uri, mime_type="video/mp4"),
+                genai_types.Part.from_uri(file_uri=proxy_uri, mime_type=proxy_mime),
                 genai_types.Part.from_text(text=prompt),
             ],
         )
     ]
 
     response = None
-    async for attempt in AsyncRetrying(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=4, max=30),
-        retry=retry_if_exception_type(Exception),
-        reraise=True,
-    ):
-        with attempt:
-            response = await genai_client().aio.models.generate_content(
-                model=s.gemini_model, contents=contents, config=config
-            )
-            if response.parsed is None and not (response.text or "").strip():
-                raise PipelineError("Gemini returned an empty response")
+    models = [s.gemini_model]
+    if s.is_local and s.gemini_fallback_model and s.gemini_fallback_model != s.gemini_model:
+        models.append(s.gemini_fallback_model)  # free-tier Pro quota is small; Flash has more
+    last_exc: Optional[Exception] = None
+    for model_name in models:
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential(multiplier=2, min=4, max=30),
+                retry=retry_if_exception_type(Exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await genai_client().aio.models.generate_content(
+                        model=model_name, contents=contents, config=config
+                    )
+                    if response.parsed is None and not (response.text or "").strip():
+                        raise PipelineError("Gemini returned an empty response")
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Gemini model %s failed: %s", model_name, exc)
+            response = None
+    if response is None:
+        msg = str(last_exc or "")
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            raise PipelineError("Gemini free quota is used up for now. Try again later or tomorrow.") from last_exc
+        raise PipelineError(f"Gemini request failed: {msg[:300]}") from last_exc
 
     assert response is not None
     plan: Optional[ViralPlan] = response.parsed if isinstance(response.parsed, ViralPlan) else None
@@ -621,6 +708,10 @@ def _clean_segments(segments: list[ViralSegment], duration: float, opts: JobOpti
         while len(prompts) < 3:
             prompts.append(f"Cinematic, abstract visual metaphor for: {seg.title}")
         seg.broll_prompts = prompts[:3]
+        terms = [t.strip() for t in seg.broll_search_terms if t.strip()]
+        while len(terms) < 3:
+            terms.append(" ".join(seg.title.split()[:3]) or "abstract background")
+        seg.broll_search_terms = terms[:3]
         seg.hashtags = [re.sub(r"[^\w]", "", h.lstrip("#")) for h in seg.hashtags if h.strip()][:6]
         seg.viral_score = max(1, min(100, int(seg.viral_score)))
         cleaned.append(seg)
@@ -687,6 +778,8 @@ async def isolate_vocals(segment_video: Path, workdir: Path) -> Path:
 
 
 def _tts_sync(text: str, voice_name: str, out: Path) -> None:
+    from google.cloud import texttospeech
+
     lang = "-".join(voice_name.split("-")[:2]) if voice_name.count("-") >= 2 else "en-US"
     response = tts_client().synthesize_speech(
         input=texttospeech.SynthesisInput(text=text),
@@ -700,10 +793,18 @@ def _tts_sync(text: str, voice_name: str, out: Path) -> None:
     out.write_bytes(response.audio_content)
 
 
-async def synthesize_voiceover(text: str, voice: str, out: Path) -> float:
+async def synthesize_voiceover(text: str, voice: str, out: Path, language_code: str = "en-US") -> float:
     text = " ".join(text.split())
     if not text:
         raise PipelineError("Commentary text is empty")
+    if get_settings().is_local:
+        from local_providers import edge_tts_to_wav, edge_voice_for
+
+        try:
+            await edge_tts_to_wav(text, edge_voice_for(voice, language_code), out, run_cmd)
+        except Exception as exc:
+            raise PipelineError(f"Voiceover failed: {exc}") from exc
+        return await ffprobe_duration(out)
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15), reraise=True
     ):
@@ -722,9 +823,31 @@ BROLL_STYLE = (
 )
 
 
-async def generate_broll(prompt: str, aspect_ratio: str, out: Path, fallback_color: str) -> Path:
-    """Generate an original B-roll still; fall back to a rendered gradient if filtered."""
+async def generate_broll(
+    prompt: str,
+    aspect_ratio: str,
+    out: Path,
+    fallback_color: str,
+    search_term: str = "",
+    fallback_video: Optional[Path] = None,
+    fallback_at: float = 1.0,
+) -> Path:
+    """Get a B-roll still.
+
+    gcp: generate an original image with Imagen 3. local: a free Pexels stock photo.
+    Fallbacks: a blurred, colour-graded frame from the clip, then a plain vignette.
+    """
     s = get_settings()
+    if s.is_local:
+        from local_providers import pexels_photo
+
+        orientation = "portrait" if aspect_ratio == "9:16" else "square"
+        try:
+            if await pexels_photo(s.pexels_api_key or "", search_term or prompt, orientation, out):
+                return out
+        except Exception as exc:
+            logger.warning("Pexels failed for %r: %s", search_term, exc)
+        return await _fallback_still(out, aspect_ratio, fallback_color, fallback_video, fallback_at)
     config = genai_types.GenerateImagesConfig(
         number_of_images=1,
         aspect_ratio=aspect_ratio,
@@ -748,9 +871,30 @@ async def generate_broll(prompt: str, aspect_ratio: str, out: Path, fallback_col
                 out.write_bytes(images[0].image.image_bytes)  # type: ignore[union-attr]
                 return out
     except Exception as exc:
-        logger.warning("B-roll generation failed for %r, using gradient fallback: %s", prompt[:80], exc)
+        logger.warning("B-roll generation failed for %r, using fallback: %s", prompt[:80], exc)
+    return await _fallback_still(out, aspect_ratio, fallback_color, fallback_video, fallback_at)
 
+
+async def _fallback_still(
+    out: Path, aspect_ratio: str, fallback_color: str, video: Optional[Path], at: float
+) -> Path:
     size = "1080x1920" if aspect_ratio == "9:16" else "1080x1080"
+    w, h = size.split("x")
+    if video is not None and video.exists():
+        try:
+            await run_cmd(
+                [
+                    "ffmpeg", "-hide_banner", "-y", "-ss", f"{max(0.0, at):.2f}", "-i", str(video),
+                    "-frames:v", "1",
+                    "-vf", f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},"
+                    f"gblur=sigma=28,eq=saturation=1.35:brightness=-0.06,vignette=angle=PI/4",
+                    str(out),
+                ],
+                timeout=60,
+            )
+            return out
+        except PipelineError:
+            pass
     await run_cmd(
         [
             "ffmpeg", "-hide_banner", "-y", "-f", "lavfi",
@@ -769,7 +913,8 @@ async def generate_broll(prompt: str, aspect_ratio: str, out: Path, fallback_col
 
 def _faces_sync(gcs_uri: str) -> list[tuple[float, float, float]]:
     """Return (time, center_x_normalized, area) samples for every detected face box."""
-    vi = videointelligence
+    from google.cloud import videointelligence as vi
+
     operation = video_client().annotate_video(
         request={
             "input_uri": gcs_uri,
@@ -849,10 +994,24 @@ def build_crop_plan(
 
 
 async def track_faces(
-    segment_gcs_uri: str, src_w: int, src_h: int, duration: float, target_aspect: float
+    segment_gcs_uri: str,
+    src_w: int,
+    src_h: int,
+    duration: float,
+    target_aspect: float,
+    segment_video: Optional[Path] = None,
 ) -> CropPlan:
+    s = get_settings()
     try:
-        samples = await asyncio.to_thread(_faces_sync, segment_gcs_uri)
+        if s.is_local:
+            from local_providers import detect_faces
+
+            model = Path(s.yunet_model_path)
+            if not model.is_absolute():
+                model = Path(__file__).resolve().parent / model
+            samples = await asyncio.to_thread(detect_faces, segment_video, str(model))
+        else:
+            samples = await asyncio.to_thread(_faces_sync, segment_gcs_uri)
     except Exception as exc:
         logger.warning("Face tracking failed, using a centred crop: %s", exc)
         samples = []
@@ -871,6 +1030,8 @@ def write_crop_commands(plan: CropPlan, path: Path) -> None:
 
 
 def _transcribe_sync(gcs_uri: str, language_code: str) -> list[Word]:
+    from google.cloud.speech_v2.types import cloud_speech
+
     s = get_settings()
     recognizer = f"projects/{s.gcp_project}/locations/{s.speech_location}/recognizers/_"
     config = cloud_speech.RecognitionConfig(
@@ -918,6 +1079,21 @@ def _transcribe_sync(gcs_uri: str, language_code: str) -> list[Word]:
 
 
 async def transcribe_words(vocals: Path, workdir: Path, gcs_prefix: str, language_code: str) -> list[Word]:
+    s = get_settings()
+    if s.is_local:
+        from local_providers import whisper_words
+
+        wav = workdir / "speech16k.wav"
+        await run_cmd(
+            ["ffmpeg", "-hide_banner", "-y", "-i", str(vocals), "-ac", "1", "-ar", "16000", str(wav)],
+            timeout=300,
+        )
+        try:
+            raw = await asyncio.to_thread(whisper_words, wav, language_code, s.whisper_model)
+        except Exception as exc:
+            logger.warning("Whisper failed; rendering without captions: %s", exc)
+            return []
+        return [Word(text=t, start=a, end=b) for t, a, b in raw]
     flac = workdir / "speech.flac"
     await run_cmd(
         ["ffmpeg", "-hide_banner", "-y", "-i", str(vocals), "-ac", "1", "-ar", "16000", "-c:a", "flac", str(flac)],
@@ -1049,6 +1225,7 @@ class RenderInputs:
     captions_file: Path
     crop_cmd_file: Path
     crop: CropPlan
+    font_path: str
     main_duration: float
     intro_duration: float
     outro_duration: float
@@ -1071,7 +1248,7 @@ def build_filtergraph(r: RenderInputs) -> str:
     s = get_settings()
     W, H, FPS = s.out_width, s.out_height, s.out_fps
     half = H // 2
-    font = font_file("Noto Sans:bold")
+    font = r.font_path.replace("\\", "/").replace("'", "")
     accent = "0x" + r.accent_hex.lstrip("#")
 
     main_d = f"{r.main_duration:.3f}"
@@ -1205,25 +1382,36 @@ async def process_clip(
     segment_video = cdir / "segment.mp4"
     await cut_segment(source, seg, segment_video)
     main_duration = await ffprobe_duration(segment_video)
-    seg_uri_task = asyncio.create_task(upload_file(segment_video, f"{gcs_prefix}/segment.mp4", "video/mp4"))
+    if s.is_local:
+        seg_uri_task = asyncio.create_task(asyncio.sleep(0, result=f"local://{gcs_prefix}/segment.mp4"))
+    else:
+        seg_uri_task = asyncio.create_task(upload_file(segment_video, f"{gcs_prefix}/segment.mp4", "video/mp4"))
 
     # Independent AI work runs concurrently.
     await report(0.15, "Generating voiceover, B-roll and tracking the speaker")
     intro_wav, outro_wav = cdir / "intro.wav", cdir / "outro.wav"
     broll_a, broll_b, card = cdir / "broll_a.png", cdir / "broll_b.png", cdir / "card.png"
 
-    intro_task = asyncio.create_task(synthesize_voiceover(seg.intro_commentary, voice, intro_wav))
-    outro_task = asyncio.create_task(synthesize_voiceover(seg.outro_commentary, voice, outro_wav))
+    lang = opts.language_code
+    intro_task = asyncio.create_task(synthesize_voiceover(seg.intro_commentary, voice, intro_wav, lang))
+    outro_task = asyncio.create_task(synthesize_voiceover(seg.outro_commentary, voice, outro_wav, lang))
+    terms = seg.broll_search_terms or ["", "", ""]
     broll_tasks = [
-        asyncio.create_task(generate_broll(seg.broll_prompts[0], "1:1", broll_a, accent)),
-        asyncio.create_task(generate_broll(seg.broll_prompts[1], "1:1", broll_b, accent)),
-        asyncio.create_task(generate_broll(seg.broll_prompts[2], "9:16", card, accent)),
+        asyncio.create_task(
+            generate_broll(seg.broll_prompts[0], "1:1", broll_a, accent, terms[0], segment_video, main_duration * 0.25)
+        ),
+        asyncio.create_task(
+            generate_broll(seg.broll_prompts[1], "1:1", broll_b, accent, terms[1], segment_video, main_duration * 0.6)
+        ),
+        asyncio.create_task(
+            generate_broll(seg.broll_prompts[2], "9:16", card, accent, terms[2], segment_video, main_duration * 0.1)
+        ),
     ]
 
     seg_uri = await seg_uri_task
     target_aspect = s.out_width / (s.out_height / 2)
     crop_task = asyncio.create_task(
-        track_faces(seg_uri, source.width, source.height, main_duration, target_aspect)
+        track_faces(seg_uri, source.width, source.height, main_duration, target_aspect, segment_video)
     )
 
     await report(0.3, "Isolating the spoken vocals")
@@ -1244,7 +1432,7 @@ async def process_clip(
     outro_txt.write_text(_wrap(seg.outro_commentary, 22, 7), encoding="utf-8")
     credit_txt.write_text(f"Clip from: {source.channel}"[:60], encoding="utf-8")
 
-    font_path = font_file("Noto Sans:bold")
+    font_path = font_for_language(opts.language_code)
     captions = cdir / "captions.ass"
     captions.write_text(
         build_ass(words, main_duration, opts.caption_color, _font_family(font_path), s.out_height // 2 + 150),
@@ -1270,6 +1458,7 @@ async def process_clip(
             captions_file=captions,
             crop_cmd_file=crop_cmd,
             crop=crop,
+            font_path=font_path,
             main_duration=main_duration,
             intro_duration=intro_duration + 0.25,
             outro_duration=outro_duration + 0.6,

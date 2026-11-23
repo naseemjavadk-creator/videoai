@@ -38,6 +38,11 @@ async function isAuthenticated(req: NextRequest): Promise<boolean> {
 
 export async function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
+  // Local mode on your own computer (only reachable from localhost): no password needed.
+  if (process.env.AUTH_DISABLED === "1") {
+    if (pathname === "/login") return NextResponse.redirect(new URL("/", req.url));
+    return NextResponse.next();
+  }
   if (PUBLIC_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
     return NextResponse.next();
   }

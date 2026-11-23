@@ -26,16 +26,24 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
-import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.cloud import storage
+import os
+import shutil
+
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-from pipeline import JobOptions, PipelineError, get_settings, result_to_dict, run_pipeline, storage_client
+from pipeline import (
+    JobOptions,
+    PipelineError,
+    get_settings,
+    local_path,
+    result_to_dict,
+    run_pipeline,
+    storage_client,
+)
 
 # --------------------------------------------------------------------------------------
 # Logging: one JSON object per line so Cloud Logging parses severity and fields.
@@ -164,7 +172,7 @@ class JobStore:
         self._locks: dict[str, asyncio.Lock] = {}
 
     @property
-    def bucket(self) -> storage.Bucket:
+    def bucket(self) -> Any:
         return storage_client().bucket(self.bucket_name)
 
     @staticmethod
@@ -273,26 +281,133 @@ class JobStore:
         return await asyncio.to_thread(_do)
 
 
-store = JobStore(settings.gcs_bucket)
+class LocalJobStore(JobStore):
+    """Same behaviour as JobStore, but documents live in DATA_DIR/jobs/<id>/status.json."""
+
+    async def _write(self, doc: dict[str, Any]) -> None:
+        path = local_path(self._path(doc["job_id"]))
+
+        def _do() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+
+        await asyncio.to_thread(_do)
+
+    async def _read(self, job_id: str) -> Optional[dict[str, Any]]:
+        path = local_path(self._path(job_id))
+
+        def _do() -> Optional[dict[str, Any]]:
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return None
+            except Exception as exc:
+                logger.warning("Could not read job %s: %s", job_id, exc)
+                return None
+
+        return await asyncio.to_thread(_do)
+
+    async def list_recent(self, limit: int) -> list[dict[str, Any]]:
+        root = local_path("jobs")
+
+        def _do() -> list[dict[str, Any]]:
+            if not root.exists():
+                return []
+            files = sorted(root.glob("*/status.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+            out: list[dict[str, Any]] = []
+            for f in files:
+                try:
+                    out.append(json.loads(f.read_text(encoding="utf-8")))
+                except Exception:
+                    continue
+            out.sort(key=lambda d: d.get("created_at", ""), reverse=True)
+            return out[:limit]
+
+        return await asyncio.to_thread(_do)
+
+    async def delete_media(self, job_id: str) -> int:
+        root = local_path(f"jobs/{job_id}")
+
+        def _do() -> int:
+            count = 0
+            if not root.exists():
+                return 0
+            for item in root.rglob("*"):
+                if item.is_file() and item.name != "status.json":
+                    item.unlink(missing_ok=True)
+                    count += 1
+            for d in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass
+            return count
+
+        return await asyncio.to_thread(_do)
+
+
+store: JobStore = LocalJobStore("local") if settings.is_local else JobStore(settings.gcs_bucket)
+
+
+async def retention_sweeper() -> None:
+    """Local mode: delete jobs older than RETENTION_HOURS (GCS lifecycle does this in the cloud)."""
+    while True:
+        try:
+            root = local_path("jobs")
+            cutoff = time.time() - settings.retention_hours * 3600
+            if root.exists():
+                for job_dir in root.iterdir():
+                    status_file = job_dir / "status.json"
+                    mtime = status_file.stat().st_mtime if status_file.exists() else job_dir.stat().st_mtime
+                    if mtime < cutoff and job_dir.name not in RUNNING_HERE:
+                        await asyncio.to_thread(shutil.rmtree, job_dir, True)
+                        logger.info("deleted expired job %s", job_dir.name)
+        except Exception:
+            logger.exception("retention sweep failed")
+        await asyncio.sleep(3600)
 
 # --------------------------------------------------------------------------------------
 # Signed URLs (V4, signed through the IAM signBlob API: no key file needed)
 # --------------------------------------------------------------------------------------
 
-_credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+if settings.is_local:
+    _credentials: Any = None
+else:
+    import google.auth
+
+    _credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
 _cred_lock = asyncio.Lock()
 
 
 async def _fresh_token() -> Optional[str]:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+
     async with _cred_lock:
         if not _credentials.valid:
             await asyncio.to_thread(_credentials.refresh, GoogleAuthRequest())
         return getattr(_credentials, "token", None)
 
 
+def _safe_name(name: str) -> str:
+    import unicodedata
+
+    keep = (c for c in name if c.isalnum() or c in " -_." or unicodedata.category(c).startswith("M"))
+    return "".join(keep).strip()[:80] or "clip"
+
+
 async def sign_url(gcs_path: str, *, download_name: Optional[str] = None) -> tuple[str, str]:
     ttl = timedelta(seconds=settings.signed_url_ttl_seconds)
     expires_at = (datetime.now(timezone.utc) + ttl).isoformat()
+    if settings.is_local:
+        from urllib.parse import quote
+
+        base = settings.public_base_url.rstrip("/")
+        url = f"{base}/media/{quote(gcs_path)}"
+        if download_name:
+            url += f"?download={quote(_safe_name(download_name))}"
+        return url, expires_at
     token = await _fresh_token()
     sa_email = settings.service_account_email or getattr(_credentials, "service_account_email", None)
 
@@ -300,8 +415,7 @@ async def sign_url(gcs_path: str, *, download_name: Optional[str] = None) -> tup
         blob = storage_client().bucket(settings.gcs_bucket).blob(gcs_path)
         kwargs: dict[str, Any] = {"version": "v4", "expiration": ttl, "method": "GET"}
         if download_name:
-            safe = "".join(c for c in download_name if c.isalnum() or c in " -_.").strip() or "clip"
-            kwargs["response_disposition"] = f'attachment; filename="{safe[:80]}.mp4"'
+            kwargs["response_disposition"] = f'attachment; filename="{_safe_name(download_name)}.mp4"'
         if not hasattr(_credentials, "sign_bytes"):
             # Compute Engine / Cloud Run metadata credentials: sign via IAM.
             kwargs["service_account_email"] = sa_email
@@ -436,6 +550,9 @@ async def worker(n: int) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     workers = [asyncio.create_task(worker(i), name=f"worker-{i}") for i in range(max(1, settings.max_concurrent_jobs))]
+    if settings.is_local:
+        local_path("jobs").mkdir(parents=True, exist_ok=True)
+        workers.append(asyncio.create_task(retention_sweeper(), name="retention"))
     logger.info("ClipSafe API ready with %d worker(s)", len(workers))
     try:
         yield
@@ -592,6 +709,11 @@ async def clip_url(job_id: str, index: int) -> SignedUrlOut:
         raise HTTPException(status_code=404, detail="Clip not found")
 
     def _size() -> int:
+        if settings.is_local:
+            p = local_path(clip["video_gcs_path"])
+            if not p.exists():
+                raise FileNotFoundError(clip["video_gcs_path"])
+            return p.stat().st_size
         blob = storage_client().bucket(settings.gcs_bucket).get_blob(clip["video_gcs_path"])
         if blob is None:
             raise FileNotFoundError(clip["video_gcs_path"])
@@ -611,3 +733,28 @@ async def clip_url(job_id: str, index: int) -> SignedUrlOut:
         description=clip["description"],
         hashtags=clip["hashtags"],
     )
+
+
+# --------------------------------------------------------------------------------------
+# Local mode: serve finished media straight from DATA_DIR (the API listens on 127.0.0.1)
+# --------------------------------------------------------------------------------------
+
+_MEDIA_TYPES = {".mp4": "video/mp4", ".jpg": "image/jpeg", ".ass": "text/plain", ".json": "application/json"}
+
+if settings.is_local:
+
+    @app.get("/media/{key:path}", include_in_schema=False)
+    async def media(key: str, download: Optional[str] = None) -> FileResponse:
+        if not key.startswith("jobs/") or ".." in key.split("/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        try:
+            path = local_path(key)
+        except PipelineError:
+            raise HTTPException(status_code=404, detail="Not found")
+        if not path.is_file() or path.name == "status.json":
+            raise HTTPException(status_code=404, detail="Not found (media is kept for 24 hours)")
+        kwargs: dict[str, Any] = {"media_type": _MEDIA_TYPES.get(path.suffix, "application/octet-stream")}
+        if download:
+            kwargs["filename"] = f"{_safe_name(download)}{path.suffix}"
+            kwargs["content_disposition_type"] = "attachment"
+        return FileResponse(path, **kwargs)

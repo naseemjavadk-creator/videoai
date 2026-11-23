@@ -26,3 +26,8 @@ out/
 .DS_Store
 .vscode/
 .idea/
+
+# Local mode (keys and media stay on your computer)
+data/
+backend/models/
+frontend/.env.local
