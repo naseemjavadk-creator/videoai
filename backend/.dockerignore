@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.env.*
+*.mp4
+*.wav
+*.mp3
+/tmp/
+.pytest_cache/
+.mypy_cache/
+.git/
